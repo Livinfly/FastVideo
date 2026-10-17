@@ -166,6 +166,7 @@ For a more detailed guide, please see our [inference quick start](https://hao-ai
 
 ## More Guides
 
+- [Portable FastH3 benchmarks](benchmarks/README.md): uv setup, named model configurations, E2E/DiT timing, GPU scaling reports, and background progress monitoring on `exp-fixed-version`.
 - [Design Overview](https://hao-ai-lab.github.io/FastVideo/design/overview/)
 - [Distillation Guide](https://hao-ai-lab.github.io/FastVideo/distillation/dmd/)
 - [Contribution Guide](https://hao-ai-lab.github.io/FastVideo/contributing/overview/)

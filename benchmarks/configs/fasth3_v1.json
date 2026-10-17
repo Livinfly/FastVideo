@@ -1,0 +1,42 @@
+{
+  "name": "fasth3_v1",
+  "adapter": "minimax_h3",
+  "model_id": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+  "sampling": {
+    "height": 768,
+    "width": 1344,
+    "num_frames": 124,
+    "fps": 24,
+    "seed": 1000,
+    "guidance_scale": 1.0,
+    "num_inference_steps": 5,
+    "batch_cfg": false
+  },
+  "prompt": "A woman sits at a wooden table by the window in a cozy café. She reaches out with her right hand, picks up the white coffee cup from the saucer, and gently brings it to her lips to take a sip. After drinking, she places the cup back on the table and looks out the window, enjoying the peaceful atmosphere.",
+  "negative_prompt": "",
+  "pipeline": {
+    "experimental": {
+      "attention_backend": "VIDEO_SPARSE_ATTN_H3",
+      "VSA_sparsity": 0.9,
+      "VSA_tile_size": 64
+    }
+  },
+  "engine": {
+    "offload": {
+      "pin_cpu_memory": false
+    }
+  },
+  "environment": {
+    "FASTVIDEO_VSA_TRITON": "1"
+  },
+  "contract": {
+    "dmd_denoising_steps": [
+      999,
+      749,
+      500,
+      250
+    ],
+    "video_shift": 12.0,
+    "audio_shift": 3.0
+  }
+}

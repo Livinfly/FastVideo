@@ -1,0 +1,25 @@
+{
+  "name": "fastwan21_14b",
+  "adapter": "fastwan21_14b",
+  "model_id": "FastVideo/FastWan2.1-T2V-14B-Diffusers",
+  "sampling": {
+    "height": 720,
+    "width": 1280,
+    "num_frames": 81,
+    "fps": 16,
+    "seed": 1024,
+    "guidance_scale": 1.0,
+    "num_inference_steps": 3,
+    "batch_cfg": false
+  },
+  "prompt": "A woman sits at a wooden table by the window in a cozy café. She reaches out with her right hand, picks up the white coffee cup from the saucer, and gently brings it to her lips to take a sip. After drinking, she places the cup back on the table and looks out the window, enjoying the peaceful atmosphere.",
+  "negative_prompt": "",
+  "pipeline": {
+    "workload_type": "t2v",
+    "experimental": {"attention_backend": "VIDEO_SPARSE_ATTN", "VSA_sparsity": 0.9}
+  },
+  "engine": {"offload": {"pin_cpu_memory": false}},
+  "environment": {},
+  "contract": {"dmd_denoising_steps": [1000, 757, 522], "flow_shift": 8.0},
+  "execution_note": "非默认：pin_cpu_memory=false，沿用此前本机 FastVideo 测试的兼容设置，原因是 FSDP pinning 曾触发 CUDA invalid argument。DiT 按层 offload、文本编码器/VAE CPU offload 均沿用原生默认；compile 默认关闭。VSA 使用 Wan 原生 (4,4,4)/64-token 块；720×1280×81 对应视频网格 21×45×80、1440 块、topk144。DMD 原生仅条件分支，每次请求恰好 3 次完整 DiT forward；不生成音频。"
+}
