@@ -18,6 +18,10 @@ def validate_profile(profile) -> None:
         from fastwan import validate_profile as validate_wan
         validate_wan(profile)
         return
+    if profile['adapter'] == 'longcat_refine':
+        from longcat import validate_profile as validate_longcat
+        validate_longcat(profile)
+        return
     if profile['adapter'] != 'minimax_h3':
         raise ValueError('Only the minimax_h3 adapter is currently implemented')
     sampling, contract = profile['sampling'], profile['contract']
@@ -50,8 +54,11 @@ def validate_profile(profile) -> None:
         raise ValueError('Stage logging adds intermediate CUDA synchronization; keep it disabled')
 
 
-def model_manifest(path, profile, gpu_counts) -> dict[str, Any]:
+def model_manifest(path, profile, gpu_counts, input_frames=None) -> dict[str, Any]:
     """Read small configs and file sizes, never hash full weight payloads at launch."""
+    if profile['adapter'] == 'longcat_refine':
+        from longcat import model_manifest as longcat_manifest
+        return longcat_manifest(path, profile, gpu_counts, input_frames)
     if profile['adapter'] == 'fastwan21_14b':
         from fastwan import model_manifest as wan_manifest
         return wan_manifest(path, profile, gpu_counts)

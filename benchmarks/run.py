@@ -32,6 +32,11 @@ def main() -> None:
                         metavar='NAME=PATH',
                         help='Repeat for every selected profile; complete local model snapshot')
     prompts = parser.add_mutually_exclusive_group()
+    parser.add_argument('--input-frames',
+                        action='append',
+                        default=[],
+                        metavar='NAME=PATH',
+                        help='Original NPY/NPZ frames for a LongCat refinement profile')
     prompts.add_argument('--prompt')
     prompts.add_argument('--prompt-file', type=Path)
     parser.add_argument('--gpus', type=int, nargs='+', default=[1])
@@ -55,6 +60,12 @@ def main() -> None:
         if not separator or not path or name in paths:
             parser.error('--model-path must be unique NAME=PATH entries')
         paths[name] = str(Path(path).expanduser().resolve())
+    inputs = {}
+    for entry in args.input_frames:
+        name, separator, path = entry.partition('=')
+        if not separator or not path or name in inputs:
+            parser.error('--input-frames must be unique NAME=PATH entries')
+        inputs[name] = str(Path(path).expanduser().resolve())
     models = {}
     for path in args.config:
         profile = read_json(path)
@@ -67,6 +78,12 @@ def main() -> None:
         if args.prompt_file:
             profile['prompt'] = args.prompt_file.read_text().strip()
         models[name] = dict(profile=profile, path=paths.get(name))
+        if profile['adapter'] == 'longcat_refine':
+            if name not in inputs:
+                parser.error(f'Supply --input-frames {name}=PATH for LongCat refinement')
+            models[name]['input_frames'] = inputs[name]
+    if set(inputs) - {name for name, item in models.items() if item['profile']['adapter'] == 'longcat_refine'}:
+        parser.error('--input-frames only accepts selected LongCat refinement profiles')
     if set(paths) != set(models):
         parser.error('Supply --model-path NAME=PATH for exactly these profiles: ' + ', '.join(models))
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
@@ -85,7 +102,10 @@ def main() -> None:
     branch = subprocess.check_output(['git', '-C', str(ROOT), 'branch', '--show-current'], text=True).strip()
     if branch != 'exp-fixed-version':
         parser.error(f'Expected exp-fixed-version branch; found {branch!r}')
-    manifests = {name: model_manifest(Path(item['path']), item['profile'], args.gpus) for name, item in models.items()}
+    manifests = {
+        name: model_manifest(Path(item['path']), item['profile'], args.gpus, item.get('input_frames'))
+        for name, item in models.items()
+    }
     devices = select_devices(inventory(), os.environ.get('CUDA_VISIBLE_DEVICES'))
     if max(args.gpus) > len(devices):
         parser.error(f'Requested {max(args.gpus)} GPUs, only {len(devices)} selected')
@@ -108,6 +128,7 @@ def main() -> None:
         write_json(suite.parent / f'{suite.name}.job.json', dict(pid=child.pid, suite=str(suite), log=str(log_path)))
         print(f'PID: {child.pid}\nSuite: {suite}\nLog: {log_path}')
         return
+
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f"Received signal {signum}")
 
@@ -175,7 +196,11 @@ def main() -> None:
                 }
                 (directory / 'command.sh').write_text(shlex.join(command) + '\n')
                 with (directory / 'inference.log').open('w') as log:
-                    child = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                    child = subprocess.Popen(command,
+                                             cwd=ROOT,
+                                             env=env,
+                                             stdout=log,
+                                             stderr=subprocess.STDOUT,
                                              start_new_session=True)
                     try:
                         code = child.wait()

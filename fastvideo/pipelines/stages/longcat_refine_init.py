@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from fastvideo.distributed import get_sp_group
+from fastvideo.distributed import get_local_torch_device, get_sp_group
 from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.logger import init_logger
 from fastvideo.models.vision_utils import load_video
@@ -26,6 +26,21 @@ from fastvideo.pipelines.stages.base import PipelineStage
 from fastvideo.configs.pipelines.longcat import get_bucket_config
 
 logger = init_logger(__name__)
+
+
+def refinement_canvas(input_height: int,
+                      input_width: int,
+                      target_size: tuple[int, int] | list[int] | None = None) -> tuple[int, int]:
+    # Our local adaptation: override only the output canvas, retaining native
+    # interpolation, padding, VAE and BSA. The default still selects a bucket.
+    if target_size is not None:
+        if (not isinstance(target_size, tuple | list) or len(target_size) != 2
+                or any(type(size) is not int or size <= 0 or size % 64 for size in target_size)):
+            raise ValueError('LongCat refinement target size must be two positive multiples of 64')
+        return target_size[0], target_size[1]
+    buckets = get_bucket_config('720p', 64)
+    closest = min(buckets, key=lambda ratio: abs(float(ratio) - input_height / input_width))
+    return tuple(buckets[closest][0])
 
 
 class LongCatRefineInitStage(PipelineStage):
@@ -125,19 +140,15 @@ class LongCatRefineInitStage(PipelineStage):
         # reject some buckets. Keep bucket selection independent of GPU count so
         # changing SP does not change the video size.
 
-        # Get bucket config and find closest bucket for the input aspect ratio
-        bucket_config = get_bucket_config('720p', scale_factor_spatial)
-
         # Get input aspect ratio from stage1 video
         input_height, input_width = pil_images[0].height, pil_images[0].width
         input_ratio = input_height / input_width
 
-        # Find closest bucket
-        closest_ratio = min(bucket_config.keys(), key=lambda x: abs(float(x) - input_ratio))
-        height, width = bucket_config[closest_ratio][0]
+        height, width = refinement_canvas(input_height, input_width, fastvideo_args.pipeline_config.refine_target_size)
 
         logger.info("Input aspect ratio: %.2f (%sx%s)", input_ratio, input_width, input_height)
-        logger.info("Matched bucket ratio: %s -> resolution: %sx%s", closest_ratio, width, height)
+        logger.info("Refinement canvas: %sx%s (override=%s)", width, height,
+                    fastvideo_args.pipeline_config.refine_target_size)
         logger.info("Target: %sx%s @ %s frames (sp_size=%s, scale_factor=%s)", width, height, new_num_frames, sp_size,
                     scale_factor_spatial)
 
@@ -213,10 +224,12 @@ class LongCatRefineInitStage(PipelineStage):
                     new_num_frames)
 
         # VAE encode with tiling for memory efficiency
-        logger.info("Encoding stage1 video with VAE (tiling enabled)...")
+        # Our local fix: restore the offloaded VAE before encoding, as in I2V/VC.
+        self.vae = self.vae.to(get_local_torch_device())
         vae_dtype = next(self.vae.parameters()).dtype
         vae_device = next(self.vae.parameters()).device
         video_up = video_up.to(dtype=vae_dtype, device=vae_device)
+        logger.info("Encoding stage1 video with VAE on %s (tiling enabled)...", vae_device)
 
         # Enable tiling for large video encoding
         if hasattr(self.vae, 'enable_tiling'):
@@ -237,6 +250,9 @@ class LongCatRefineInitStage(PipelineStage):
             else:
                 # Assume it's already a tensor
                 latent_up = latent_dist
+
+        if fastvideo_args.vae_cpu_offload:
+            self.vae.to("cpu")
 
         # Normalize latents using VAE config (exactly like LongCat)
         if hasattr(self.vae.config, 'latents_mean') and hasattr(self.vae.config, 'latents_std'):

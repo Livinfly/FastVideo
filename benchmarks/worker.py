@@ -55,6 +55,12 @@ def main() -> None:
         if profile['adapter'] == 'fastwan21_14b':
             from fastwan import VSAExecutionAudit
             audit = VSAExecutionAudit(transformer, profile)
+        stage1_frames = None
+        if profile['adapter'] == 'longcat_refine':
+            from longcat import LongCatExecutionAudit, load_frames
+            stage1_frames = load_frames(plan['models'][args.model]['input_frames'], profile['contract'])
+            audit = LongCatExecutionAudit(profile)
+            audit.handle = transformer.register_forward_pre_hook(audit.observe, with_kwargs=True)
         timer = DiTEvents(torch, effective['expected_dit_forwards']) if 'dit' in plan['modes'] else None
         torch.cuda.synchronize()
         dist.barrier()
@@ -93,7 +99,8 @@ def main() -> None:
             phase = 'warmup' if warmup else 'repeat'
             tag = f'{mode}_{phase}_{repeat}'
             output = args.output / f'{tag}.mp4'
-            request = make_request(profile, output)
+            request = (make_request(profile, output, stage1_frames)
+                       if profile['adapter'] == 'longcat_refine' else make_request(profile, output))
             if audit is not None:
                 audit.rows.clear()
             if mode == 'dit':
@@ -129,7 +136,7 @@ def main() -> None:
                          peak_allocated_gib=torch.cuda.max_memory_allocated() / 2**30,
                          peak_reserved_gib=torch.cuda.max_memory_reserved() / 2**30)
             if audit is not None:
-                local['vsa_execution'] = audit.collect()
+                local['bsa_execution' if profile['adapter'] == 'longcat_refine' else 'vsa_execution'] = audit.collect()
             per_rank = [None] * world
             dist.all_gather_object(per_rank, local)
             record = aggregate(per_rank, mode=mode, tag=tag, warmup=warmup, repeat=repeat)
@@ -145,7 +152,7 @@ def main() -> None:
                               video_file=str(Path(result.video_path).relative_to(args.output)))
                 if plan['validate_video']:
                     media = (video_metadata(result.video_path, require_audio=False)
-                             if profile['adapter'] == 'fastwan21_14b' else video_metadata(result.video_path))
+                             if profile['adapter'] != 'minimax_h3' else video_metadata(result.video_path))
                     if any(media[k] != sampling[s]
                            for k, s in [('frames', 'num_frames'), ('width', 'width'), ('height',
                                                                                        'height'), ('fps', 'fps')]):

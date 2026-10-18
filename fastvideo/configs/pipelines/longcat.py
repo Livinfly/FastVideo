@@ -150,6 +150,9 @@ class LongCatT2V480PConfig(PipelineConfig):
     bsa_chunk_q: list[int] | None = None
     bsa_chunk_k: list[int] | None = None
     t_thresh: float | None = None  # refine stage default controlled by sampling args
+    # Our local adaptation: optional fixed refinement canvas for workload alignment.
+    # None preserves the native aspect-ratio bucket selection.
+    refine_target_size: tuple[int, int] | None = None
 
     # LongCat does not need flow_shift
     flow_shift: float | None = None

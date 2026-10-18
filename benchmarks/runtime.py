@@ -45,22 +45,30 @@ def dense_attention_info(transformer):
         dict(module=name, implementation=type(module.attn_impl).__name__)
         for name, module in transformer.named_modules() if hasattr(module, 'attn_impl')
     ]
-    required = [row for row in routes if row['module'].startswith('token_refiner.') or '.attn2.' in row['module']]
+    required = [
+        row for row in routes
+        if row['module'].startswith('token_refiner.') or '.attn2.' in row['module'] or '.cross_attn.' in row['module']
+    ]
     if not required or any(row['implementation'] != 'FlashAttentionImpl' for row in required):
         raise ValueError(f'Native preferred DiT dense attention did not select FlashAttention: {required}')
     return routes
 
 
 def generator_config(profile, model_path, world):
-    from fastvideo.api import (CompileConfig, EngineConfig, GeneratorConfig, OffloadConfig, ParallelismConfig,
-                               PipelineSelection)
+    from fastvideo.api import (CompileConfig, ComponentConfig, EngineConfig, GeneratorConfig, OffloadConfig,
+                               ParallelismConfig, PipelineSelection)
     engine = dict(profile['engine'])
     for key, cls in [('offload', OffloadConfig), ('compile', CompileConfig)]:
         if key in engine:
             engine[key] = cls(**engine[key])
     pipeline = dict(profile['pipeline'])
-    pipeline['experimental'] = dict(pipeline['experimental'],
-                                    dmd_denoising_steps=profile['contract']['dmd_denoising_steps'])
+    if 'dmd_denoising_steps' in profile['contract']:
+        pipeline['experimental'] = dict(pipeline['experimental'],
+                                        dmd_denoising_steps=profile['contract']['dmd_denoising_steps'])
+    if profile['adapter'] == 'longcat_refine':
+        pipeline['components'] = ComponentConfig(lora_path=str(
+            Path(model_path) / 'lora/refinement/refinement_lora.safetensors'),
+                                                 lora_nickname='refinement')
     return GeneratorConfig(model_path=str(model_path),
                            engine=EngineConfig(num_gpus=world,
                                                execution_backend='external_launcher',
@@ -70,6 +78,9 @@ def generator_config(profile, model_path, world):
 
 
 def check_pipeline(pipe, profile):
+    if profile['adapter'] == 'longcat_refine':
+        from longcat import check_pipeline as check_longcat
+        return check_longcat(pipe, profile)
     if profile['adapter'] == 'fastwan21_14b':
         from fastwan import check_pipeline as check_wan
         return check_wan(pipe, profile)
@@ -106,7 +117,10 @@ def check_pipeline(pipe, profile):
                              forward_layout=[dict(forward_index=i, dmd_rung=rung) for i, rung in enumerate(ladder)])
 
 
-def make_request(profile, path):
+def make_request(profile, path, stage1_frames=None):
+    if profile['adapter'] == 'longcat_refine':
+        from longcat import make_request as longcat_request
+        return longcat_request(profile, path, stage1_frames)
     from fastvideo.api import GenerationRequest, OutputConfig, SamplingConfig
     return GenerationRequest(prompt=profile['prompt'],
                              negative_prompt=profile['negative_prompt'],

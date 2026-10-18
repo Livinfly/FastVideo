@@ -1,0 +1,60 @@
+{
+  "name": "longcat_refine",
+  "adapter": "longcat_refine",
+  "model_id": "FastVideo/LongCat-Video-T2V-Diffusers",
+  "sampling": {
+    "height": 1024,
+    "width": 1024,
+    "num_frames": 186,
+    "fps": 30,
+    "seed": 42,
+    "guidance_scale": 1.0,
+    "num_inference_steps": 50,
+    "batch_cfg": false,
+    "max_sequence_length": 512
+  },
+  "prompt": "A woman sits at a wooden table by the window in a cozy café. She reaches out with her right hand, picks up the white coffee cup from the saucer, and gently brings it to her lips to take a sip. After drinking, she places the cup back on the table and looks out the window, enjoying the peaceful atmosphere.",
+  "negative_prompt": "",
+  "pipeline": {
+    "workload_type": "t2v",
+    "experimental": {
+      "enable_bsa": true,
+      "bsa_sparsity": 0.9375,
+      "bsa_chunk_q": [
+        4,
+        4,
+        4
+      ],
+      "bsa_chunk_k": [
+        4,
+        4,
+        4
+      ],
+      "refine_target_size": [
+        1024,
+        1024
+      ]
+    }
+  },
+  "engine": {
+    "offload": {
+      "pin_cpu_memory": false
+    }
+  },
+  "environment": {},
+  "contract": {
+    "t_thresh": 0.5,
+    "spatial_refine_only": false,
+    "num_cond_frames": 0,
+    "scheduler_shift": 12.0,
+    "expected_dit_forwards": 5,
+    "input_shape": [
+      93,
+      640,
+      640,
+      3
+    ],
+    "input_frames_sha256": "c52c9dad7048f520cb8ef1255f860857e3e82068d44b7952a73033d0e21e738c"
+  },
+  "execution_note": "非默认：refine_target_size=[1024,1024]，我们增加的可选目标画布配置，用于与官方 LongCat benchmark 对齐，替代原生方形 960×960 bucket；不改变插值、补帧、BSA、调度或 VAE。显式启用 refinement BSA（sparsity=0.9375，Q/K tile444）和本地转换的 refinement LoRA，强度1。输入为校验一致的原始 uint8 93×640×640 帧，输出186×1024×1024、30fps。沿用其他 FastVideo 测试的 pin_cpu_memory=false 兼容设置；DiT 按层 offload、文本编码器/VAE CPU offload 及 compile 均保留原生默认。视频编码器保留 FastVideo 默认，不强行匹配官方 writer 的 CRF。"
+}
