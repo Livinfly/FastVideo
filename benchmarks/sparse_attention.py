@@ -16,7 +16,8 @@ AST insertion retains native operations and validates equality after erasing
 event calls. Existing decorators, hooks and compiled helpers are retained.
 DTensor communication hook boundaries add explicit compiler breaks for event
 recording; no collective or per-layer synchronization is added. Whole-block
-compile/graphs are unsupported. Events are preallocated/primed outside requests;
+compile/graphs are rejected except Omni H3 with its native recursive eager
+attention boundary and Omni Wan with explicit eager event breaks. Events are preallocated/primed outside requests;
 results are read after the caller's post-request synchronization. Side-stream
 work is covered by its existing consumer dependency, not double-counted.
 
@@ -34,6 +35,7 @@ import math
 import os
 import textwrap
 import types
+import weakref
 
 
 ENV = "VIDEO_BENCH_SPARSE_ATTENTION"
@@ -208,6 +210,55 @@ def _patch_bcg_passthrough(wrapper, original, patched):
     return eager_only
 
 
+def _compiled_eager_boundary(module, cls, name):
+    """Keep compiled blocks; require native eager attention or explicit event breaks."""
+    if cls.__name__ == "WanTransformerBlock" and cls.__module__.startswith("vllm_omni"):
+        return dict(compiled_block_preserved=True, compile_event_breaks=True,
+                    compilation_note="Eager event bookkeeping adds breaks before/after attention runtime")
+    if cls.__name__ != "MiniMaxH3DiTBlock" or not cls.__module__.startswith("vllm_omni"):
+        raise ValueError(f"Compiled block forward unsupported: {name}")
+    boundary = getattr(module.attn, "_run_packed_attention", None)
+    if (not getattr(boundary, "_torchdynamo_disable", False)
+            or not getattr(boundary, "_torchdynamo_disable_recursive", False)):
+        raise ValueError(f"Compiled H3 requires its native recursive eager attention boundary: {name}")
+    original = getattr(boundary, "_torchdynamo_orig_callable", None)
+    if original is None or getattr(boundary, "__wrapped__", None) is not original:
+        raise ValueError(f"Unverified native H3 eager wrapper: {name}")
+    source = inspect.getsource(original)
+    tree = ast.parse(textwrap.dedent(source))
+    fn = tree.body[0]
+    if ([source_text(d) for d in fn.decorator_list] != ["torch.compiler.disable"]
+            or not any(isinstance(n, ast.Call) and source_text(n.func) == "self.attention"
+                       for n in ast.walk(fn))):
+        raise ValueError(f"Native H3 eager attention dispatch changed: {name}")
+    return dict(compiled_block_preserved=True, native_eager_boundary=original.__qualname__,
+                native_eager_boundary_source_sha256=hashlib.sha256(source.encode()).hexdigest())
+
+
+# Reuse the exact compiled runtime function across warmup/formal observers.
+# Values retain only a weak owner reference; finished models can be collected.
+_COMPILED_RUNTIME_CACHE = weakref.WeakKeyDictionary()
+_NABLA_HOOK_CACHE = weakref.WeakKeyDictionary()
+
+
+class _EagerEventProxy:
+    def __init__(self, torch, owner):
+        self.owner = weakref.ref(owner)
+        self.clock = None
+        self.start = torch.compiler.disable(self._start)
+        self.end = torch.compiler.disable(self._end)
+
+    def _start(self, unused_owner, part):
+        if self.clock is None or self.owner() is None:
+            raise ValueError("Compiled attention has no active event observer")
+        self.clock.start(self.owner(), part)
+
+    def _end(self, unused_owner, part):
+        if self.clock is None or self.owner() is None:
+            raise ValueError("Compiled attention has no active event observer")
+        self.clock.end(self.owner(), part)
+
+
 class SparseAttentionEvents:
     """One request's range events; root timer supplies the forward index."""
 
@@ -223,6 +274,7 @@ class SparseAttentionEvents:
         self.names = {}
         self.manifest = []
         self.hook_restore = []
+        self.event_proxies = []
         self.active_forward = False
         self.completed_forwards = 0
         self.seen = set()
@@ -236,10 +288,11 @@ class SparseAttentionEvents:
                     continue
                 owner, attribute = _method_owner(module)
                 native = getattr(owner, attribute, None)
-                if hasattr(native, "_torchdynamo_orig_callable"):
-                    raise ValueError(f"Compiled block forward unsupported: {name}")
+                compile_evidence = (_compiled_eager_boundary(module, cls, name)
+                                    if hasattr(native, "_torchdynamo_orig_callable") else {})
                 self.names[id(module)] = name
-                self._attach(module, cls, name)
+                self._attach(module, cls, name, compile_evidence.get("compile_event_breaks", False))
+                self.manifest[-1].update(compile_evidence)
             if not self.manifest:
                 raise ValueError("No supported sparse attention runtime found")
             self.expected_ranges = {(key, "runtime") for key in self.names}
@@ -260,7 +313,7 @@ class SparseAttentionEvents:
         self.restore.append((owner, attribute, getattr(owner, attribute), attribute in vars(owner)))
         setattr(owner, attribute, value)
 
-    def _patched_function(self, function, profile, module, name):
+    def _patched_function(self, function, profile, module, name, event_breaks=False):
         function = getattr(function, "__func__", function)
         if profile != "LongCatUlysses":
             function = inspect.unwrap(function)
@@ -271,7 +324,24 @@ class SparseAttentionEvents:
         evidence.update(layer=name, class_name=type(module).__name__,
                         source_file=inspect.getsourcefile(function),
                         source_first_line=inspect.getsourcelines(function)[1])
-        namespace = dict(function.__globals__, __sparse_clock=self, __sparse_owner=module)
+        clock = self
+        if event_breaks:
+            cached = _COMPILED_RUNTIME_CACHE.get(module)
+            if cached is not None:
+                native, patched, clock = cached
+                if native is not function:
+                    raise ValueError(f"Native compiled runtime changed between requests: {name}")
+                if clock.clock is not None:
+                    raise ValueError(f"Compiled runtime already has an event observer: {name}")
+                clock.clock = self
+                self.event_proxies.append(clock)
+                self.manifest.append(evidence)
+                return patched
+            clock = _EagerEventProxy(self.torch, module)
+            clock.clock = self
+            self.event_proxies.append(clock)
+        namespace = dict(function.__globals__, __sparse_clock=clock,
+                         __sparse_owner=None if event_breaks else module)
         if profile == "LongCatUlysses":
             namespace.update(inspect.getclosurevars(function).nonlocals)
         exec(compile(tree, f"<sparse-runtime:{name}:{profile}>", "exec",
@@ -279,14 +349,16 @@ class SparseAttentionEvents:
         patched = functools.update_wrapper(namespace[function.__name__], function)
         for decorator in reversed(evidence["decorators_preserved"]):
             patched = function.__globals__[decorator](patched)
+        if event_breaks:
+            _COMPILED_RUNTIME_CACHE[module] = (function, patched, clock)
         self.manifest.append(evidence)
         return patched
 
-    def _patch_method(self, target, attribute, profile, module, name):
-        patched = self._patched_function(getattr(target, attribute), profile, module, name)
+    def _patch_method(self, target, attribute, profile, module, name, event_breaks=False):
+        patched = self._patched_function(getattr(target, attribute), profile, module, name, event_breaks)
         self._replace(target, attribute, types.MethodType(patched, target))
 
-    def _attach(self, module, cls, name):
+    def _attach(self, module, cls, name, event_breaks=False):
         framework = cls.__module__
         if cls.__name__ == "MiniMaxH3TransformerBlock":
             self._patch_method(module.attn.distributed_attention, "forward", "DistributedAttention_VSA", module, name)
@@ -310,7 +382,7 @@ class SparseAttentionEvents:
             self._replace(target, "_attend", types.MethodType(cloned, target))
         elif framework.startswith("vllm_omni"):
             target = module.attn.attention if cls.__name__ == "MiniMaxH3DiTBlock" else module.attn1.attn
-            self._patch_method(target, "_forward_impl", "OmniAttention", module, name)
+            self._patch_method(target, "_forward_impl", "OmniAttention", module, name, event_breaks)
         elif cls.__name__ == "MMDoubleStreamBlock":
             owner, attribute = _method_owner(module)
             original = getattr(owner, attribute).__func__
@@ -348,15 +420,32 @@ class SparseAttentionEvents:
         o_key, o_hook = select(output_hooks, "PrepareModuleInput")
         # Hook event bookkeeping runs eager even inside compiled get_qkv/out_l.
         # Existing DTensor hooks and compiled arithmetic remain in their order.
-        begin = self.torch.compiler.disable(self.start)
-        finish = self.torch.compiler.disable(self.end)
-        def input_exchange(*args, **kwargs):
-            begin(module, "runtime")
-            return q_hook(*args, **kwargs)
-        def output_exchange(*args, **kwargs):
-            result = o_hook(*args, **kwargs)
-            finish(module, "runtime")
-            return result
+        cached = _NABLA_HOOK_CACHE.get(module)
+        if cached is None:
+            proxy = _EagerEventProxy(self.torch, module)
+            def input_exchange(*args, **kwargs):
+                proxy.start(None, "runtime")
+                return q_hook(*args, **kwargs)
+            def output_exchange(*args, **kwargs):
+                result = o_hook(*args, **kwargs)
+                proxy.end(None, "runtime")
+                return result
+            # Each layer has a different proxy. Skip only these bookkeeping
+            # frames, avoiding per-proxy Dynamo guards/cache exhaustion while
+            # permitting the original redistribution hooks to compile.
+            input_exchange = self.torch.compiler.disable(input_exchange, recursive=False)
+            output_exchange = self.torch.compiler.disable(output_exchange, recursive=False)
+            _NABLA_HOOK_CACHE[module] = (q_hook, o_hook, input_exchange, output_exchange, proxy)
+        else:
+            native_q, native_o, input_exchange, output_exchange, proxy = cached
+            if native_q is not q_hook or native_o is not o_hook:
+                raise ValueError(f"Native NABLA DTensor hooks changed between requests: {name}")
+        if proxy.clock is not None:
+            raise ValueError(f"NABLA DTensor hooks already have an event observer: {name}")
+        # Stable hooks prevent compiled get_qkv/out_l from guarding a new
+        # closure/observer identity on every formal request after warmup.
+        proxy.clock = self
+        self.event_proxies.append(proxy)
         self.hook_restore.extend([(q_hooks, q_key, q_hook), (output_hooks, o_key, o_hook)])
         q_hooks[q_key] = input_exchange
         output_hooks[o_key] = output_exchange
@@ -393,6 +482,8 @@ class SparseAttentionEvents:
         return stream.cuda_stream, str(stream.device)
 
     def start(self, module, part):
+        if self.torch.compiler.is_compiling():
+            raise ValueError("Sparse runtime event bookkeeping must execute eagerly")
         if self.torch.cuda.is_current_stream_capturing():
             raise ValueError("Sparse range timing requires native graph mode off")
         key = (id(module), part)
@@ -432,6 +523,10 @@ class SparseAttentionEvents:
                     forward_ms=totals, rows=rows, boundaries=self.manifest)
 
     def detach(self):
+        for proxy in self.event_proxies:
+            if proxy.clock is self:
+                proxy.clock = None
+        self.event_proxies.clear()
         for hooks, key, hook in reversed(self.hook_restore):
             hooks[key] = hook
         self.hook_restore.clear()
