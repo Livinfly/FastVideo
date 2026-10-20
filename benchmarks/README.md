@@ -134,3 +134,15 @@ suite/
 
 已有 suite 拒绝覆盖。运行期间不要修改推理源码、模型和 suite 快照。
 CPU 检查：`.venv/bin/python -m unittest discover -s benchmarks -p 'test_*.py' -v`。
+
+## Sparse attention runtime 计时（scope v2）
+
+添加 `--sparse-attention`（需 `dit` 模式）。起点是 attention 输入通信阶段开始前；终点是最后结果回传/聚合及必要依赖等待完成、输出可用时。区间内包含路由/选块、调度、稀疏计算、KV/元数据通信、结果合并与等待。单卡采用对应 runtime 的入口/出口。
+
+通常不含输入 Norm、通信前的 QKV/QK Norm/RoPE、输出投影和 residual；按源码实际位置计入，不能笼统宣称所有框架这些操作都在区间外。SGLang H3 包含反向 All-to-All 后的 coarse All-Gather 和 gate fold；SSTA 包含文本头 All-Gather；NABLA 多卡通信与投影交错，连续区间会包含 K/V 投影和 QK Norm/RoPE，manifest 明确标注。准确起止点见 [sparse_attention.py](sparse_attention.py) 的运行时 `boundaries`。
+
+事件在请求外预分配并初始化，不新增逐层同步或 collective；异步通信利用原有执行流依赖保证结果可用。保留原生 hooks/编译 helper；NABLA 多卡在 DTensor hooks 内的事件记录显式保持 eager，可能产生 helper 图断点，需单独核实插桩扰动。whole-block compile/graph 不支持，不自动改变原配置。
+
+逐 forward/layer/rank 数据、源码锚点和 `scope_version=2` 保存于 `metrics.json` 的 `per_rank[].sparse_attention`，计划文件也记录版本和范围。主拆分在完整 DiT 最慢的同一 rank 上计算：attention + 其余 DiT = 完整 DiT；另存最大 attention rank 的总和，不相加各层独立最大 rank。
+
+旧 `scope_version=1` 是 Norm → residual，不能重标或混入新结果。`dit` 模式在同一请求记录 E2E、完整 DiT 和 attention 三项；使用 `--modes dit --warmup 1 --repeats 1 --sparse-attention` 可做单次测量。`e2e` 模式移除 attention 插桩，可按需作对照；模式间差异包含整请求波动，不等同于纯插桩成本。各模型的 GPU 验证状态以具体实验结果为准。

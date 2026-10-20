@@ -129,7 +129,7 @@ def main() -> None:
                 timer.detach()
             torch.cuda.synchronize()
             durations = timer.elapsed_ms() if mode == 'dit' else None
-            local = dict(rank=rank,
+            local = dict(sparse_attention=timer.sparse_result() if mode == 'dit' and plan.get('sparse_attention_timing') else None, rank=rank,
                          response_e2e_s=response_s,
                          distributed_e2e_s=distributed_s,
                          dit_step_ms=durations,

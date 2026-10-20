@@ -49,7 +49,13 @@ def main() -> None:
     parser.add_argument('--validate-video', action='store_true')
     parser.add_argument('--baseline', type=Path, help='Opt in: compare another suite summary.json')
     parser.add_argument('--wait-for', type=Path, help='Also wait for another suite status.json')
+    parser.add_argument('--sparse-attention', action='store_true',
+                        help='Scope v2: attention input communication through result return/aggregation and output readiness; see sparse_attention.py')
     args = parser.parse_args()
+    if args.sparse_attention:
+        os.environ['VIDEO_BENCH_SPARSE_ATTENTION'] = '1'
+        if 'dit' not in args.modes:
+            parser.error('--sparse-attention requires dit mode')
     if min(args.gpus) < 1 or args.warmup < 1 or args.repeats < 1:
         parser.error('Require positive GPU counts, >=1 warmup and >=1 measured request')
     if len(set(args.gpus)) != len(args.gpus) or len(set(args.modes)) != len(args.modes):
@@ -162,6 +168,10 @@ def main() -> None:
                 validate_video=args.validate_video,
                 wait_for=str(args.wait_for.resolve()) if args.wait_for else None,
                 pid=os.getpid())
+    plan['sparse_attention_timing'] = os.environ.get('VIDEO_BENCH_SPARSE_ATTENTION') == '1'
+    from sparse_attention import SCOPE, SCOPE_VERSION
+    plan['sparse_attention_scope_version'] = SCOPE_VERSION if plan['sparse_attention_timing'] else None
+    plan['sparse_attention_range'] = SCOPE if plan['sparse_attention_timing'] else None
     write_json(suite / 'plan.json', plan)
     status: dict[str, Any] = dict(status='waiting', pid=os.getpid(), total=len(groups), completed=[], current=None)
     from report import generate_report

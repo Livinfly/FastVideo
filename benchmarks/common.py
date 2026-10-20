@@ -71,6 +71,8 @@ def aggregate(per_rank, *, mode, tag, warmup, repeat) -> dict[str, Any]:
                       dit_forward_step_max_sum_s=sum(map(max, zip(*matrix, strict=False))) / 1000)
     elif any(r['dit_step_ms'] is not None for r in ranks):
         raise ValueError('e2e mode must not contain DiT measurements')
+    from sparse_attention import aggregate_sparse
+    aggregate_sparse(record, ranks)
     return record
 
 
@@ -84,7 +86,9 @@ def measurements_complete(metrics, plan, mode=None) -> bool:
 
 def summarize(records) -> dict[str, Any]:
     result = {}
-    for field in FIELDS:
+    from sparse_attention import SPARSE_FIELDS, validate_record_scopes
+    validate_record_scopes(records)
+    for field in FIELDS + SPARSE_FIELDS:
         values = [r[field] for r in records if field in r]
         if values:
             result[field] = dict(values=values,

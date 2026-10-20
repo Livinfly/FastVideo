@@ -165,6 +165,8 @@ def generate_report(suite, baseline=None) -> None:
         '', f"组状态：`{status['completed']}`。", '',
         '原始逐 rank 数据见 `<模型>/gN/metrics.json`；失败摘要与日志路径见 [status.json](status.json)。', ''
     ]
+    from sparse_attention import report_lines
+    lines += report_lines(rows)
     (suite / 'report.md').write_text('\n'.join(lines))
     write_json(suite / 'summary.json',
                dict(status=status['status'], plan=plan, results=rows, timing_comparisons=comparisons, review=findings))
